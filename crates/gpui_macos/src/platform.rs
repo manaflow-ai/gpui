@@ -539,6 +539,21 @@ impl MacPlatform {
             return;
         }
 
+        if self.0.lock().hosted {
+            // The host owns NSApplication and its delegate: observe with a
+            // GPUI delegate object of our own instead of the host's delegate.
+            // SAFETY: APP_DELEGATE_CLASS declares the `platform` ivar and the
+            // `onSystemSleep:` / `onSystemWake:` handlers; the platform outlives
+            // the app (it is owned by the leaked hosted Application).
+            unsafe {
+                let observer: id = msg_send![APP_DELEGATE_CLASS, new];
+                (*observer).set_ivar(MAC_PLATFORM_IVAR, self as *const Self as *const c_void);
+                register_system_power_observers(&*(observer as *const AnyObject));
+            }
+            self.0.lock().system_power_observers_registered = true;
+            return;
+        }
+
         // The shared application must be created through `APP_CLASS`, or `run`
         // finds a plain `NSApplication` without the `platform` ivar; only the
         // delegate lookup goes through the typed binding.
