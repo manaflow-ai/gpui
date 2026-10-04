@@ -30,7 +30,8 @@ use gpui::{
     Pixels, PlatformAtlas, PlatformDisplay, PlatformFrameSignal, PlatformInput,
     PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
     SharedString, Size, SystemWindowTab, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControlArea, WindowKind, WindowParams, WindowVisibility, point, px, size,
+    WindowBounds, WindowControlArea, WindowKind, WindowParams, WindowParent, WindowVisibility,
+    point, px, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -293,6 +294,37 @@ unsafe fn build_classes() {
             decl.add_method(
                 sel!(characterIndexForPoint:),
                 character_index_for_point as extern "C" fn(&Object, Sel, NSPoint) -> u64,
+            );
+
+            // Hosted windows (`WindowOptions::parent`): focus and edit commands.
+            decl.add_method(
+                sel!(acceptsFirstResponder),
+                accepts_first_responder as extern "C" fn(&Object, Sel) -> BOOL,
+            );
+            decl.add_method(
+                sel!(becomeFirstResponder),
+                become_first_responder as extern "C" fn(&Object, Sel) -> BOOL,
+            );
+            decl.add_method(
+                sel!(resignFirstResponder),
+                resign_first_responder as extern "C" fn(&Object, Sel) -> BOOL,
+            );
+            for selector in [
+                sel!(copy:),
+                sel!(cut:),
+                sel!(paste:),
+                sel!(selectAll:),
+                sel!(undo:),
+                sel!(redo:),
+            ] {
+                decl.add_method(
+                    selector,
+                    host_edit_command as extern "C" fn(&Object, Sel, id),
+                );
+            }
+            decl.add_method(
+                sel!(validateMenuItem:),
+                validate_host_edit_command as extern "C" fn(&Object, Sel, id) -> BOOL,
             );
             decl.register()
         };
@@ -708,6 +740,9 @@ struct MacWindowState {
     activated_least_once: bool,
     closed: Arc<AtomicBool>,
     accesskit_adapter: Option<accesskit_macos::SubclassingAdapter>,
+    /// Set when the window renders into a host toolkit's view
+    /// (`WindowOptions::parent`). `native_window` is then the host's window.
+    host: Option<HostAttachment>,
     // The parent window if this window is a sheet (Dialog kind)
     sheet_parent: Option<id>,
 }
@@ -931,8 +966,12 @@ impl MacWindowState {
     }
 
     fn content_size(&self) -> Size<Pixels> {
-        let NSSize { width, height, .. } =
-            unsafe { NSView::frame(self.native_window.contentView()) }.size;
+        let view = if self.host.is_some() {
+            self.native_view.as_ptr() as id
+        } else {
+            unsafe { self.native_window.contentView() }
+        };
+        let NSSize { width, height, .. } = unsafe { NSView::frame(view) }.size;
         size(px(width as f32), px(height as f32))
     }
 
@@ -971,6 +1010,7 @@ impl MacWindow {
             display_id,
             window_min_size,
             tabbing_identifier,
+            parent,
             ..
         }: WindowParams,
         cursor_visible: Arc<AtomicBool>,
@@ -979,6 +1019,13 @@ impl MacWindow {
         renderer_context: renderer::Context,
         marker: MainThreadMarker,
     ) -> Self {
+        // A hosted window never shows or focuses the window GPUI creates: that
+        // window only owns the GPUI view's state until the view moves into the host.
+        let (focus, show) = if parent.is_some() {
+            (false, false)
+        } else {
+            (focus, show)
+        };
         unsafe {
             let pool = NSAutoreleasePool::new(nil);
 
@@ -1145,6 +1192,7 @@ impl MacWindow {
                 closed: Arc::new(AtomicBool::new(false)),
                 accesskit_adapter: None,
                 sheet_parent: None,
+                host: None,
             }));
             let mut window = Self(state, marker);
 
@@ -1302,9 +1350,58 @@ impl MacWindow {
                 window_state.sheet_parent = sheet_parent;
             }
 
+            if let Some(parent) = parent {
+                window.attach_to_host(parent);
+            }
+
             pool.drain();
 
             window
+        }
+    }
+
+    /// Move the GPUI view into the host's `NSView` (`WindowOptions::parent`).
+    ///
+    /// The `NSWindow` GPUI created stays offscreen as the view's owner: it keeps the
+    /// `windowState` ivar and is registered for the host window's key, occlusion and
+    /// screen notifications, so the existing delegate handlers run unchanged.
+    /// `native_window` becomes the host window, which is what scale, display,
+    /// occlusion and key state are read from. Window-level operations that belong
+    /// to the host (title, ordering, fullscreen, zoom, minimize, background) are
+    /// skipped for a hosted window.
+    unsafe fn attach_to_host(&self, parent: WindowParent) {
+        let rwh::RawWindowHandle::AppKit(handle) = parent.0 else {
+            log::error!("WindowParent on macOS must be an AppKit NSView handle");
+            return;
+        };
+        let host_view = handle.ns_view.as_ptr() as id;
+        unsafe {
+            let host_window: id = msg_send![host_view, window];
+            if host_window.is_null() {
+                log::error!("the host NSView must be in a window before GPUI attaches to it");
+                return;
+            }
+            let (view, owner) = {
+                let lock = self.0.lock();
+                (lock.native_view.as_ptr() as id, lock.native_window)
+            };
+            // No lock is held here: `setFrame:` calls GPUI's `setFrameSize:`.
+            let bounds: NSRect = msg_send![host_view, bounds];
+            let _: () = msg_send![view, removeFromSuperview];
+            let _: () = msg_send![view, setFrame: bounds];
+            view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable);
+            let _: () = msg_send![host_view, addSubview: view];
+            let center: id = msg_send![class!(NSNotificationCenter), defaultCenter];
+            for (selector, name) in host_window_notifications() {
+                let _: () = msg_send![center, addObserver: owner selector: selector name: ns_string(name) object: host_window];
+            }
+            let mut lock = self.0.lock();
+            lock.native_window = host_window;
+            lock.host = Some(HostAttachment {
+                owner_window: owner,
+                host_view,
+            });
+            lock.start_display_link();
         }
     }
 
@@ -1384,6 +1481,7 @@ impl Drop for MacWindow {
         // the adapter here so the native view, its `CAMetalLayer` and the
         // renderer's command queue are actually released with the window.
         drop(this.accesskit_adapter.take());
+        this.detach_from_host();
         this.renderer.destroy();
         let window = this.native_window;
         let sheet_parent = this.sheet_parent.take();
@@ -1438,6 +1536,9 @@ impl PlatformWindow for MacWindow {
     }
 
     fn resize(&mut self, size: Size<Pixels>) {
+        if self.0.lock().host.is_some() {
+            return; // the host owns its window
+        }
         let this = self.0.lock();
         let window = this.native_window;
         let closed = this.closed.clone();
@@ -1654,13 +1755,13 @@ impl PlatformWindow for MacWindow {
     }
 
     fn mouse_position(&self) -> Point<Pixels> {
-        let position = unsafe {
-            self.0
-                .lock()
-                .native_window
-                .mouseLocationOutsideOfEventStream()
-        };
-        convert_mouse_position(position, self.content_size().height)
+        let lock = self.0.lock();
+        let position = unsafe { lock.native_window.mouseLocationOutsideOfEventStream() };
+        let (height, dx) = lock.view_origin();
+        drop(lock);
+        let mut p = convert_mouse_position(position, height);
+        p.x -= px(dx as f32);
+        p
     }
 
     fn modifiers(&self) -> Modifiers {
@@ -1787,6 +1888,15 @@ impl PlatformWindow for MacWindow {
 
     fn activate(&self) {
         let lock = self.0.lock();
+        if lock.host.is_some() {
+            // Hosted: take the host window's keyboard focus, never order or activate.
+            let (window, view) = (lock.native_window, lock.native_view.as_ptr() as id);
+            drop(lock);
+            unsafe {
+                let _: BOOL = msg_send![window, makeFirstResponder: view];
+            }
+            return;
+        }
         let window = lock.native_window;
         let closed = lock.closed.clone();
         let executor = lock.foreground_executor.clone();
@@ -1818,7 +1928,7 @@ impl PlatformWindow for MacWindow {
     }
 
     fn is_active(&self) -> bool {
-        unsafe { self.0.lock().native_window.isKeyWindow() == YES }
+        self.0.lock().is_key()
     }
 
     fn visibility(&self) -> WindowVisibility {
@@ -1831,6 +1941,9 @@ impl PlatformWindow for MacWindow {
     }
 
     fn set_title(&mut self, title: &str) {
+        if self.0.lock().host.is_some() {
+            return; // the host owns its window
+        }
         unsafe {
             let app = NSApplication::sharedApplication(nil);
             let window = self.0.lock().native_window;
@@ -1861,6 +1974,9 @@ impl PlatformWindow for MacWindow {
         let opaque = background_appearance == WindowBackgroundAppearance::Opaque;
         this.renderer.update_transparency(!opaque);
 
+        if this.host.is_some() {
+            return; // the host owns its window's background
+        }
         unsafe {
             this.native_window.setOpaque_(opaque as BOOL);
             let background_color = if opaque {
@@ -1903,6 +2019,9 @@ impl PlatformWindow for MacWindow {
     }
 
     fn set_edited(&mut self, edited: bool) {
+        if self.0.lock().host.is_some() {
+            return; // the host owns its window
+        }
         unsafe {
             let window = self.0.lock().native_window;
             msg_send![window, setDocumentEdited: edited as BOOL]
@@ -1939,6 +2058,9 @@ impl PlatformWindow for MacWindow {
     }
 
     fn minimize(&self) {
+        if self.0.lock().host.is_some() {
+            return; // the host owns its window
+        }
         let window = self.0.lock().native_window;
         unsafe {
             window.miniaturize_(nil);
@@ -1946,6 +2068,9 @@ impl PlatformWindow for MacWindow {
     }
 
     fn zoom(&self) {
+        if self.0.lock().host.is_some() {
+            return; // the host owns its window
+        }
         let this = self.0.lock();
         let window = this.native_window;
         let closed = this.closed.clone();
@@ -1959,6 +2084,9 @@ impl PlatformWindow for MacWindow {
     }
 
     fn toggle_fullscreen(&self) {
+        if self.0.lock().host.is_some() {
+            return; // the host owns its window
+        }
         let this = self.0.lock();
         let window = this.native_window;
         let closed = this.closed.clone();
@@ -2207,6 +2335,9 @@ impl PlatformWindow for MacWindow {
     }
 
     fn start_window_move(&self) {
+        if self.0.lock().host.is_some() {
+            return; // the host owns its window
+        }
         let this = self.0.lock();
         if this.simple_fullscreen_state.is_some() {
             return;
@@ -2361,12 +2492,22 @@ impl PlatformWindow for MacWindow {
         };
         let action_handler = A11yActionHandler(callbacks.action);
 
+        // A hosted window parents its tree under the GPUI view in the host's
+        // hierarchy instead of subclassing the host window's content view.
         let adapter = unsafe {
-            accesskit_macos::SubclassingAdapter::for_window(
-                lock.native_window as *mut c_void,
-                activation_handler,
-                action_handler,
-            )
+            if lock.host.is_some() {
+                accesskit_macos::SubclassingAdapter::new(
+                    lock.native_view.as_ptr() as *mut c_void,
+                    activation_handler,
+                    action_handler,
+                )
+            } else {
+                accesskit_macos::SubclassingAdapter::for_window(
+                    lock.native_window as *mut c_void,
+                    activation_handler,
+                    action_handler,
+                )
+            }
         };
 
         lock.accesskit_adapter = Some(adapter);
@@ -2448,6 +2589,181 @@ unsafe fn is_gpui_window(window: id) -> bool {
         msg_send![window, isKindOfClass: WINDOW_CLASS]
             || msg_send![window, isKindOfClass: PANEL_CLASS]
     }
+}
+
+/// A window rendering into a host toolkit's view (`WindowOptions::parent`).
+struct HostAttachment {
+    /// The offscreen window GPUI created; it owns the view's state and observes
+    /// the host window's notifications.
+    owner_window: id,
+    host_view: id,
+}
+
+/// Host window notifications forwarded to the owner window's delegate methods.
+fn host_window_notifications() -> [(Sel, &'static str); 4] {
+    [
+        (
+            sel!(windowDidBecomeKey:),
+            "NSWindowDidBecomeKeyNotification",
+        ),
+        (
+            sel!(windowDidResignKey:),
+            "NSWindowDidResignKeyNotification",
+        ),
+        (
+            sel!(windowDidChangeOcclusionState:),
+            "NSWindowDidChangeOcclusionStateNotification",
+        ),
+        (
+            sel!(windowDidChangeScreen:),
+            "NSWindowDidChangeScreenNotification",
+        ),
+    ]
+}
+
+impl MacWindowState {
+    /// Key status. A hosted window is key when the host window is key and the
+    /// GPUI view is its first responder (focus moves between host controls and GPUI).
+    fn is_key(&self) -> bool {
+        unsafe {
+            let key = self.native_window.isKeyWindow() == YES;
+            if self.host.is_none() {
+                return key;
+            }
+            let first: id = msg_send![self.native_window, firstResponder];
+            key && first == self.native_view.as_ptr() as id
+        }
+    }
+
+    /// The height and x offset that map window coordinates (bottom-left origin)
+    /// to the view's top-left coordinates. A hosted view does not fill its window.
+    fn view_origin(&self) -> (Pixels, f64) {
+        let height = self.content_size().height;
+        if self.host.is_none() {
+            return (height, 0.0);
+        }
+        let origin: NSPoint = unsafe {
+            msg_send![self.native_view.as_ptr() as id, convertPoint: NSPoint::new(0.0, 0.0) toView: nil]
+        };
+        (height + px(origin.y as f32), origin.x)
+    }
+
+    /// Undo `attach_to_host`: stop observing the host window and remove the view.
+    fn detach_from_host(&mut self) {
+        let Some(host) = self.host.take() else { return };
+        unsafe {
+            let center: id = msg_send![class!(NSNotificationCenter), defaultCenter];
+            let _: () = msg_send![center, removeObserver: host.owner_window];
+            let _: () = msg_send![self.native_view.as_ptr() as id, removeFromSuperview];
+        }
+        self.native_window = host.owner_window;
+    }
+}
+
+/// Shift the window-relative x of a hosted view's pointer events.
+fn offset_input_x(event: &mut PlatformInput, dx: f64) {
+    if dx == 0.0 {
+        return;
+    }
+    let dx = px(dx as f32);
+    match event {
+        PlatformInput::MouseDown(e) => e.position.x -= dx,
+        PlatformInput::MouseUp(e) => e.position.x -= dx,
+        PlatformInput::MouseMove(e) => e.position.x -= dx,
+        PlatformInput::MouseExited(e) => e.position.x -= dx,
+        PlatformInput::MousePressure(e) => e.position.x -= dx,
+        PlatformInput::ScrollWheel(e) => e.position.x -= dx,
+        PlatformInput::Pinch(e) => e.position.x -= dx,
+        _ => {}
+    }
+}
+
+/// A hosted GPUI view takes part in the host's key view loop and focus.
+extern "C" fn accepts_first_responder(this: &Object, _: Sel) -> BOOL {
+    let state = unsafe { get_window_state(this) };
+    state.lock().host.is_some() as BOOL
+}
+
+extern "C" fn become_first_responder(this: &Object, _: Sel) -> BOOL {
+    let ok: BOOL = unsafe { msg_send![super(this, class!(NSView)), becomeFirstResponder] };
+    notify_host_focus(this, true);
+    ok
+}
+
+extern "C" fn resign_first_responder(this: &Object, _: Sel) -> BOOL {
+    let ok: BOOL = unsafe { msg_send![super(this, class!(NSView)), resignFirstResponder] };
+    notify_host_focus(this, false);
+    ok
+}
+
+/// In a host, focus moving into or out of the GPUI view is GPUI's window
+/// activation. AppKit updates `firstResponder` after these calls return, so the
+/// key-status handler runs on the next turn of the run loop.
+fn notify_host_focus(this: &Object, became: bool) {
+    let state = unsafe { get_window_state(this) };
+    let lock = state.lock();
+    let Some(host) = lock.host.as_ref() else {
+        return;
+    };
+    let owner = host.owner_window;
+    let closed = lock.closed.clone();
+    let executor = lock.foreground_executor.clone();
+    drop(lock);
+    executor
+        .spawn(async move {
+            if_window_not_closed(closed, || {
+                let selector = if became {
+                    sel!(windowDidBecomeKey:)
+                } else {
+                    sel!(windowDidResignKey:)
+                };
+                window_did_change_key_status(unsafe { &*owner }, selector, nil);
+            });
+        })
+        .detach();
+}
+
+/// The host's standard edit commands (Edit menu items, `copy:` sent down the
+/// responder chain) reach GPUI as the same keystrokes the shortcuts produce, so
+/// the GPUI keymap decides what each one does.
+extern "C" fn host_edit_command(this: &Object, selector: Sel, _sender: id) {
+    let state = unsafe { get_window_state(this) };
+    if state.lock().host.is_none() {
+        return;
+    }
+    let key = if selector == sel!(copy:) {
+        "cmd-c"
+    } else if selector == sel!(cut:) {
+        "cmd-x"
+    } else if selector == sel!(paste:) {
+        "cmd-v"
+    } else if selector == sel!(selectAll:) {
+        "cmd-a"
+    } else if selector == sel!(undo:) {
+        "cmd-z"
+    } else if selector == sel!(redo:) {
+        "cmd-shift-z"
+    } else {
+        return;
+    };
+    let Ok(keystroke) = Keystroke::parse(key) else {
+        return;
+    };
+    let mut lock = state.lock();
+    if let Some(mut callback) = lock.event_callback.take() {
+        drop(lock);
+        callback(PlatformInput::KeyDown(KeyDownEvent {
+            keystroke,
+            is_held: false,
+            prefer_character_input: false,
+        }));
+        state.lock().event_callback = Some(callback);
+    }
+}
+
+extern "C" fn validate_host_edit_command(this: &Object, _: Sel, _item: id) -> BOOL {
+    let state = unsafe { get_window_state(this) };
+    state.lock().host.is_some() as BOOL
 }
 
 unsafe fn get_window_state(object: &Object) -> Arc<Mutex<MacWindowState>> {
@@ -2778,9 +3094,28 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
 extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
     let window_state = unsafe { get_window_state(this) };
     let weak_window_state = Arc::downgrade(&window_state);
-    let mut lock = window_state.as_ref().lock();
-    let window_height = lock.content_size().height;
     let native_event_type = unsafe { native_event.eventType() };
+    // A click in a hosted view moves the host's keyboard focus into GPUI.
+    if matches!(
+        native_event_type,
+        NSEventType::NSLeftMouseDown
+            | NSEventType::NSRightMouseDown
+            | NSEventType::NSOtherMouseDown
+    ) {
+        let lock = window_state.lock();
+        if lock.host.is_some() {
+            let (window, view) = (lock.native_window, lock.native_view.as_ptr() as id);
+            drop(lock);
+            unsafe {
+                let first: id = msg_send![window, firstResponder];
+                if first != view {
+                    let _: BOOL = msg_send![window, makeFirstResponder: view];
+                }
+            }
+        }
+    }
+    let mut lock = window_state.as_ref().lock();
+    let (window_height, view_dx) = lock.view_origin();
     match native_event_type {
         NSEventType::NSLeftMouseDown => {
             // AppKit owns `native_event` for the callback; retain it so the drag session can still
@@ -2793,7 +3128,10 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
         }
         _ => {}
     }
-    let event = unsafe { platform_input_from_native(native_event, Some(window_height)) };
+    let mut event = unsafe { platform_input_from_native(native_event, Some(window_height)) };
+    if let Some(event) = event.as_mut() {
+        offset_input_x(event, view_dx);
+    }
 
     if let Some(mut event) = event {
         // AppKit unhides the cursor on the next mouse movement; mirror that here.
@@ -3119,7 +3457,7 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
     let signal_at = PlatformFrameSignal::capture(scheduler::Instant::now);
     let window_state = unsafe { get_window_state(this) };
     let lock = window_state.lock();
-    let is_active = unsafe { lock.native_window.isKeyWindow() == YES };
+    let is_active = lock.is_key();
 
     // AppKit also unhides the cursor on activation changes, so mirror that here.
     lock.cursor_visible.store(true, Ordering::Relaxed);
@@ -3133,7 +3471,7 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
     // The following code detects the spurious event and invokes `resignKeyWindow`:
     // in theory, we're not supposed to invoke this method manually but it balances out
     // the spurious `becomeKeyWindow` event and helps us work around that bug.
-    if selector == sel!(windowDidBecomeKey:) && !is_active {
+    if selector == sel!(windowDidBecomeKey:) && !is_active && lock.host.is_none() {
         let native_window = lock.native_window;
         drop(lock);
         unsafe {
@@ -3394,6 +3732,13 @@ fn get_frame(this: &Object) -> NSRect {
     unsafe {
         let state = get_window_state(this);
         let lock = state.lock();
+        if lock.host.is_some() {
+            // The hosted view's frame in screen coordinates.
+            let view = lock.native_view.as_ptr() as id;
+            let bounds: NSRect = msg_send![view, bounds];
+            let in_window: NSRect = msg_send![view, convertRect: bounds toView: nil];
+            return msg_send![lock.native_window, convertRectToScreen: in_window];
+        }
         let mut frame = NSWindow::frame(lock.native_window);
         let content_layout_rect: CGRect = msg_send![lock.native_window, contentLayoutRect];
         let style_mask: NSWindowStyleMask = msg_send![lock.native_window, styleMask];
