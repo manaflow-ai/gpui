@@ -186,6 +186,9 @@ pub(crate) struct MacPlatformState {
     text_system: Arc<dyn PlatformTextSystem>,
     renderer_context: renderer::Context,
     headless: bool,
+    /// Hosted in another AppKit application: the host owns `NSApplication`, its
+    /// delegate, the run loop, the menu bar and activation (see `new_hosted`).
+    hosted: bool,
     activation_policy: ActivationPolicy,
     application_created: bool,
     general_pasteboard: Pasteboard,
@@ -228,6 +231,21 @@ fn native_activation_policy(policy: ActivationPolicy) -> NSApplicationActivation
 }
 
 impl MacPlatform {
+    /// A platform for GPUI hosted inside another AppKit application.
+    ///
+    /// The host has already created `NSApplication`, set its own delegate and
+    /// runs the run loop. `Platform::run` therefore only invokes the launch
+    /// callback and returns (use `Application::run_embedded`), and the
+    /// app-level operations that belong to the host (quit, activate, hide, the
+    /// menu bar and the Dock menu) do nothing. GPUI work is scheduled on the
+    /// main dispatch queue, which the host's run loop drains. Windows are
+    /// opened with `WindowOptions::parent` set to a host `NSView`.
+    pub fn new_hosted() -> Self {
+        let platform = Self::new(false);
+        platform.0.lock().hosted = true;
+        platform
+    }
+
     pub fn new(headless: bool) -> Self {
         let marker = MainThreadMarker::new().expect("Mac platform not created on main thread");
         let dispatcher = Arc::new(AppleDispatcher::new());
@@ -250,6 +268,7 @@ impl MacPlatform {
 
         let state = Mutex::new(MacPlatformState {
             headless,
+            hosted: false,
             activation_policy: ActivationPolicy::Regular,
             application_created: false,
             text_system,
@@ -549,8 +568,19 @@ impl Platform for MacPlatform {
         self.0.lock().text_system.clone()
     }
 
+    fn supports_window_parent(&self) -> bool {
+        true
+    }
+
     fn run(&self, on_finish_launching: Box<dyn FnOnce()>) {
         let mut state = self.0.lock();
+        if state.hosted {
+            // The host's NSApplication is already running; never start a second
+            // run loop or replace its delegate.
+            drop(state);
+            on_finish_launching();
+            return;
+        }
         if state.headless {
             drop(state);
             on_finish_launching();
@@ -592,6 +622,9 @@ impl Platform for MacPlatform {
     }
 
     fn quit(&self) {
+        if self.0.lock().hosted {
+            return;
+        }
         // Quitting the app causes us to close windows, which invokes `Window::on_close` callbacks
         // synchronously before this method terminates. If we call `Platform::quit` while holding a
         // borrow of the app state (which most of the time we will do), we will end up
@@ -660,6 +693,9 @@ impl Platform for MacPlatform {
     }
 
     fn activate(&self, ignoring_other_apps: bool) {
+        if self.0.lock().hosted {
+            return;
+        }
         unsafe {
             let app = NSApplication::sharedApplication(nil);
             app.activateIgnoringOtherApps_(ignoring_other_apps.to_objc());
@@ -1154,6 +1190,9 @@ impl Platform for MacPlatform {
     }
 
     fn set_menus(&self, menus: Vec<Menu>, keymap: &Keymap) {
+        if self.0.lock().hosted {
+            return;
+        }
         unsafe {
             let app: id = msg_send![APP_CLASS, sharedApplication];
             let mut state = self.0.lock();
@@ -1170,6 +1209,9 @@ impl Platform for MacPlatform {
     }
 
     fn set_dock_menu(&self, menu: Vec<MenuItem>, keymap: &Keymap) {
+        if self.0.lock().hosted {
+            return;
+        }
         unsafe {
             let app: id = msg_send![APP_CLASS, sharedApplication];
             let mut state = self.0.lock();

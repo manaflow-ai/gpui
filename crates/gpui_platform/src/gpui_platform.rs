@@ -20,6 +20,24 @@ pub fn application() -> gpui::Application {
     gpui::Application::with_platform(current_platform(false))
 }
 
+/// An application hosted inside another toolkit's application (macOS: an AppKit
+/// app that already runs `NSApplication`). Start it with
+/// [`gpui::Application::run_embedded`] and open windows with
+/// `WindowOptions::parent` set to the host view. Returns `None` on platforms
+/// without host support yet.
+pub fn hosted_application() -> Option<gpui::Application> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(gpui::Application::with_platform(Rc::new(
+            gpui_macos::MacPlatform::new_hosted(),
+        )))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 pub fn headless() -> gpui::Application {
     gpui::Application::with_platform(current_platform(true))
 }
