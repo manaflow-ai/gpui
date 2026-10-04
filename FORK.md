@@ -26,7 +26,8 @@ Branches: `messageslab/external-host` (base: zed `main` at a84689073d29,
    delegate, the run loop, the menu bar, the Dock menu and activation:
    `Platform::run` only runs the launch callback and returns (use the existing
    `Application::run_embedded`), and `quit`, `activate`, `set_menus` and
-   `set_dock_menu` do nothing. GPUI work runs on the main dispatch queue, which
+   `set_dock_menu` do nothing. Sleep and wake are observed with a GPUI
+   delegate object of its own, never the host's delegate. GPUI work runs on the main dispatch queue, which
    the host's run loop drains. Files: `crates/gpui_macos/src/platform.rs`,
    `crates/gpui_platform/src/gpui_platform.rs`.
 
