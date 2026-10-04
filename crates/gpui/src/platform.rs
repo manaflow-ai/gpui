@@ -330,6 +330,12 @@ pub trait Platform: 'static {
     fn text_system(&self) -> Arc<dyn PlatformTextSystem>;
 
     fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>);
+
+    /// Whether [`WindowOptions::parent`] is supported: windows can render into
+    /// a host toolkit's view.
+    fn supports_window_parent(&self) -> bool {
+        false
+    }
     fn quit(&self);
     /// Switches a capable platform between headless and windowed modes. See
     /// [`App::request_windowing`].
@@ -2433,6 +2439,20 @@ pub enum TextInputAction {
     Send,
 }
 
+/// A native view, owned by another UI toolkit, that a GPUI window renders into
+/// instead of creating its own top-level window.
+///
+/// The handle uses `raw-window-handle` so the shape is the same on every
+/// platform: an `NSView` on macOS today; an `HWND` (child window) on Windows and
+/// an X11 window or a Wayland surface (subsurface) on Linux can follow. The host
+/// keeps ownership of the view, its window, the run loop and the application
+/// lifecycle. GPUI adds one child view that fills the host view, follows its
+/// size and backing scale, takes part in the host's responder chain and focus,
+/// and parents its accessibility tree under the host view. See
+/// [`Platform::supports_window_parent`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowParent(pub raw_window_handle::RawWindowHandle);
+
 /// The variables that can be configured when creating a new window
 #[derive(Debug)]
 pub struct WindowOptions {
@@ -2504,6 +2524,10 @@ pub struct WindowOptions {
 
     /// Tab group name, allows opening the window as a native tab on macOS 10.12+. Windows with the same tabbing identifier will be grouped together.
     pub tabbing_identifier: Option<String>,
+
+    /// Render into a host-provided native view instead of a new top-level
+    /// window (see [`WindowParent`]). `None` creates a normal window.
+    pub parent: Option<WindowParent>,
 }
 
 /// The variables that can be configured when creating a new window
@@ -2569,6 +2593,10 @@ pub struct WindowParams {
 
     #[cfg(target_os = "macos")]
     pub tabbing_identifier: Option<String>,
+
+    /// The host view to render into, if any (see [`WindowParent`]).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub parent: Option<WindowParent>,
 }
 
 /// Represents the status of how a window should be opened.
@@ -2630,6 +2658,7 @@ impl Default for WindowOptions {
             window_min_size: None,
             window_decorations: None,
             tabbing_identifier: None,
+            parent: None,
         }
     }
 }

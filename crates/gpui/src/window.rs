@@ -1548,7 +1548,12 @@ impl Window {
             icon,
             #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
             tabbing_identifier,
+            parent,
         } = options;
+
+        if parent.is_some() && !cx.platform.supports_window_parent() {
+            anyhow::bail!("WindowOptions::parent is not supported on this platform yet");
+        }
 
         let initial_window_title = titlebar
             .as_ref()
@@ -1573,6 +1578,7 @@ impl Window {
                 icon,
                 #[cfg(target_os = "macos")]
                 tabbing_identifier,
+                parent,
             },
         )?;
 
