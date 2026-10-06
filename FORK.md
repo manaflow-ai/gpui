@@ -61,5 +61,17 @@ Branches: `messageslab/external-host` (base: zed `main` at a84689073d29,
    window), host view moving to another window after attach.
    File: `crates/gpui_macos/src/window.rs`.
 
+4. **gpui_apple: Display P3 frame buffer (Colour space).** The macOS
+   `CAMetalLayer` gets `colorspace = kCGColorSpaceDisplayP3`. Why: without a
+   colour space the layer's values reach the display unmatched, so a colour
+   means "this display's RGB" and changes between displays and in captures.
+   Tagged, the compositor colour-matches the frame buffer; a colour given in
+   Display P3 components (messageslab measures its palette in Display P3 with
+   `screencapture -l`) is the same on every display. Greys are unchanged (P3
+   and sRGB share the white point and the transfer curve). Consequence for
+   consumers: colours and images are Display P3 values; convert sRGB inputs.
+   Headless and iOS rendering are unchanged. File:
+   `crates/gpui_apple/src/metal_renderer.rs` (`configure_layer`).
+
 Consumer: manaflow-ai/messageslab `gpui/` (C ABI `gpui/src/embed.rs`, AppKit
 host `gpui-embed/`, design and stage 2 plan in `gpui/EMBED.md`).

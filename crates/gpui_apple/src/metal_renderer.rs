@@ -197,6 +197,19 @@ impl MetalRenderer {
             objc2_quartz_core::CAAutoresizingMask::LayerWidthSizable
                 | objc2_quartz_core::CAAutoresizingMask::LayerHeightSizable,
         );
+        // manaflow-ai fork: tag the frame buffer as Display P3. Without a colour
+        // space the layer's values reach the display unmatched (they mean
+        // "display RGB", which differs per display); tagged, the compositor
+        // colour-matches them, so a colour given in Display P3 components is the
+        // same on every display and in `screencapture -l` (FORK.md: Colour space).
+        #[cfg(target_os = "macos")]
+        unsafe {
+            use core_graphics::color_space::{CGColorSpace, kCGColorSpaceDisplayP3};
+            if let Some(space) = CGColorSpace::create_with_name(kCGColorSpaceDisplayP3) {
+                let raw: *mut c_void = space.as_ptr().cast();
+                let _: () = objc2::msg_send![objc2_layer, setColorspace: raw];
+            }
+        }
     }
 
     /// Creates a new headless MetalRenderer for offscreen rendering without a window.
